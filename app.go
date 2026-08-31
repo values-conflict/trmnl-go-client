@@ -25,30 +25,33 @@ const (
 
 	// Timing constants for UI delays
 	WindowInitDelay     = 500 * time.Millisecond // Time to wait for window initialization
-	StartupScreenDelay  = 2 * time.Second         // How long to show startup screen
-	SuccessMessageDelay = 2 * time.Second         // How long to show success messages
+	StartupScreenDelay  = 2 * time.Second        // How long to show startup screen
+	SuccessMessageDelay = 2 * time.Second        // How long to show success messages
 )
 
 var (
 	// Command-line flags
-	apiKey       = flag.String("api-key", "", "TRMNL API key (for usetrmnl.com)")
-	deviceID     = flag.String("device-id", "", "Device ID (for self-hosted servers)")
-	macAddress   = flag.String("mac-address", "", "MAC address to use as Device ID (e.g. AA:BB:CC:DD:EE:FF)")
-	netInterface = flag.String("interface", "", "Network interface for MAC address (e.g. en0, eth0)")
-	baseURL      = flag.String("base-url", "", "Base URL for TRMNL API")
-	model        = flag.String("model", "", "Device model (e.g., TRMNL, virtual-hd, virtual-fhd)")
-	listModels   = flag.Bool("list-models", false, "List available device models")
-	width        = flag.Int("width", 0, "Window width (overrides model default)")
-	height       = flag.Int("height", 0, "Window height (overrides model default)")
-	darkMode     = flag.Bool("dark", false, "Enable dark mode (invert colors)")
-	noDarkMode   = flag.Bool("no-dark", false, "Disable dark mode (overrides saved config)")
-	ePaperMode   = flag.Bool("epaper", false, "Enable e-paper mode (4-bit grayscale with dithering)")
-	noEPaperMode = flag.Bool("no-epaper", false, "Disable e-paper mode (overrides saved config)")
-	alwaysOnTop  = flag.Bool("always-on-top", false, "Keep window always on top (macOS only)")
-	fullscreen   = flag.Bool("fullscreen", false, "Enable fullscreen mode")
-	rotation     = flag.Int("rotation", 0, "Rotate image (degrees: 0, 90, 180, 270, or -90)")
-	mirrorMode   = flag.Bool("mirror", false, "Use mirror mode (show current screen, not device-specific)")
-	setup        = flag.Bool("setup", false, "Run setup to retrieve API key via MAC address")
+	apiKey           = flag.String("api-key", "", "TRMNL API key (for usetrmnl.com)")
+	deviceID         = flag.String("device-id", "", "Device ID (for self-hosted servers)")
+	macAddress       = flag.String("mac-address", "", "MAC address to use as Device ID (e.g. AA:BB:CC:DD:EE:FF)")
+	netInterface     = flag.String("interface", "", "Network interface for MAC address (e.g. en0, eth0)")
+	baseURL          = flag.String("base-url", "", "Base URL for TRMNL API")
+	model            = flag.String("model", "", "Device model (e.g., TRMNL, virtual-hd, virtual-fhd)")
+	listModels       = flag.Bool("list-models", false, "List available device models")
+	width            = flag.Int("width", 0, "Window width (overrides model default)")
+	height           = flag.Int("height", 0, "Window height (overrides model default)")
+	darkMode         = flag.Bool("dark", false, "Enable dark mode (invert colors)")
+	noDarkMode       = flag.Bool("no-dark", false, "Disable dark mode (overrides saved config)")
+	ePaperMode       = flag.Bool("epaper", false, "Enable e-paper mode (4-bit grayscale with dithering)")
+	noEPaperMode     = flag.Bool("no-epaper", false, "Disable e-paper mode (overrides saved config)")
+	alwaysOnTop      = flag.Bool("always-on-top", false, "Keep window always on top (macOS only)")
+	fullscreen       = flag.Bool("fullscreen", false, "Enable fullscreen mode")
+	rotation         = flag.Int("rotation", 0, "Rotate image (degrees: 0, 90, 180, 270, or -90)")
+	mirrorMode       = flag.Bool("mirror", false, "Use mirror mode (show current screen, not device-specific)")
+	output           = flag.String("output", "", "Display backend: window (default) or framebuffer (Linux, bypasses X11/Wayland)")
+	fbDevice         = flag.String("fb", "", "Framebuffer device for -output=framebuffer (default /dev/fb0)")
+	takeConsole      = flag.Bool("take-console", false, "Switch the active console to our VT at startup (framebuffer mode, like X11)")
+	setup            = flag.Bool("setup", false, "Run setup to retrieve API key via MAC address")
 	useFyne          = flag.Bool("use-fyne", false, "Force use of Fyne GUI (default: native window on macOS)")
 	verbose          = flag.Bool("verbose", false, "Enable verbose logging")
 	logFlushInterval = flag.Int("log-flush-interval", 0, "How often to flush logs to API in seconds (default: 1800/30min, set 60 for dev)")
@@ -70,18 +73,18 @@ type DisplayWindow interface {
 }
 
 type App struct {
-	config         *config.Config
-	client         *api.Client
-	window         DisplayWindow
-	logger         *logging.Logger
-	stopCh         chan struct{}
-	doneCh         chan struct{}
-	refreshCh      chan struct{}
-	rotateCh       chan struct{}
-	verbose        bool
-	needsSetup     bool
-	lastImageData  []byte // Store last fetched image for rotation without refresh
-	isConnected    bool   // Track if we've successfully connected
+	config        *config.Config
+	client        *api.Client
+	window        DisplayWindow
+	logger        *logging.Logger
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+	refreshCh     chan struct{}
+	rotateCh      chan struct{}
+	verbose       bool
+	needsSetup    bool
+	lastImageData []byte // Store last fetched image for rotation without refresh
+	isConnected   bool   // Track if we've successfully connected
 }
 
 // generateRandomMAC generates a random MAC address
@@ -206,6 +209,18 @@ func runGUIApp() {
 	if *mirrorMode {
 		cfg.MirrorMode = true
 	}
+	if *output != "" {
+		if *output != config.OutputWindow && *output != config.OutputFramebuffer {
+			log.Fatalf("Invalid output backend: %q (expected \"window\" or \"framebuffer\")", *output)
+		}
+		cfg.Output = *output
+	}
+	if *fbDevice != "" {
+		cfg.FramebufferDevice = *fbDevice
+	}
+	if *takeConsole {
+		cfg.TakeConsole = true
+	}
 	if *verbose {
 		cfg.Verbose = true
 	}
@@ -305,6 +320,9 @@ func runGUIApp() {
 		}
 
 		fmt.Printf("Window: %dx%d\n", cfg.WindowWidth, cfg.WindowHeight)
+		if cfg.Output == config.OutputFramebuffer {
+			fmt.Printf("Output: framebuffer (%s)\n", cfg.FramebufferDevice)
+		}
 		fmt.Printf("Dark Mode: %v\n", cfg.DarkMode)
 		fmt.Printf("E-Paper Mode: %v\n", cfg.EPaperMode)
 		fmt.Printf("Mirror Mode: %v\n", cfg.MirrorMode)

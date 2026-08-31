@@ -94,6 +94,42 @@ go build -o trmnl-go
 
 **Note:** fyne-cross will be automatically installed if not present. It uses Docker containers to cross-compile for all platforms with native dependencies (CoreWLAN, WLAN API, etc.).
 
+### Framebuffer / Headless Mode (Linux)
+
+On Linux, the display can be written directly to a framebuffer device
+(`/dev/fb0` by default), bypassing X11/Wayland and window managers entirely —
+useful for headless hardware like a Raspberry Pi running as the console:
+
+```bash
+# In a normal build (Fyne still linked for window mode):
+./trmnl-go -output=framebuffer -fb=/dev/fb0 -model TRMNL -epaper
+```
+
+For a leaner binary with no Fyne/GL/X11 dependencies at all, build with the
+`headless` tag (Linux-only). No CGO or cross toolchain needed:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags headless -o trmnl-go-linux-arm64 .
+./trmnl-go-linux-arm64 -output=framebuffer -model TRMNL -epaper
+```
+
+Notes:
+- Requires read/write access to the framebuffer device (root, or `video`
+  group / a udev rule).
+- Taking over `/dev/fb0` covers the kernel console; it is not restored on
+  exit (switch VTs with Ctrl+Alt+F1..F6 to get a console back).
+- Keyboard shortcuts don't apply (there is no window). Instead, send
+  signals to the process: `kill -s USR1` or `kill -s HUP` for a manual
+  refresh (Ctrl+R equivalent), `kill -s USR2` to cycle rotation
+  (Ctrl+T equivalent).
+- The image only exists on the console (VT) you started it from. Switching
+  away (Ctrl+Alt+F<n>) makes the kernel repaint the fb with that other
+  console, and switching back is detected automatically (within ~0.5s)
+  and the image is repainted. When running on the console's TTY, the
+  cursor is hidden for the lifetime of the program and restored on exit
+  (`SIGKILL` skips the restore: `setterm -cursor on`).
+- Only 16- and 32-bit framebuffers are supported.
+
 ## Usage Examples
 
 ```bash
@@ -147,6 +183,9 @@ go build -o trmnl-go
   -no-epaper                Disable e-paper mode (overrides saved config)
   -always-on-top            Keep window on top (macOS only)
   -use-fyne                 Force Fyne GUI (default: native on macOS)
+  -output string            Display backend: window (default) or framebuffer (Linux)
+  -fb string                Framebuffer device for -output=framebuffer (default /dev/fb0)
+  -take-console             Switch the active console to our VT at startup (framebuffer mode)
   -verbose                  Enable verbose logging
   -log-flush-interval int   Log flush interval in seconds (default: 1800, use 60 for dev)
   -version                  Show version

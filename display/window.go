@@ -1,3 +1,9 @@
+//go:build !headless
+
+// This file implements the Fyne-based display window. It is excluded when
+// building with -tags headless, which produces a lean Linux framebuffer-only
+// binary with no Fyne/GL/X11 dependencies (see app_linux_headless.go).
+
 package display
 
 import (

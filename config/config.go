@@ -49,6 +49,19 @@ type Config struct {
 	// MirrorMode uses /api/current_screen instead of device-specific display
 	MirrorMode bool `json:"mirror_mode,omitempty"`
 
+	// Output selects the display backend:
+	// "window" (default, X11/Wayland/WM window via Fyne or native) or
+	// "framebuffer" (write directly to a Linux framebuffer device, no display server needed)
+	Output string `json:"output,omitempty"`
+
+	// FramebufferDevice is the framebuffer device to write to when Output == "framebuffer"
+	FramebufferDevice string `json:"framebuffer_device,omitempty"`
+
+	// TakeConsole switches the active console to our VT at startup when
+	// running with Output == "framebuffer" on a VT (like X11 does at login).
+	// Note: this happens on every start, including crash-restarts.
+	TakeConsole bool `json:"take_console,omitempty"`
+
 	// Verbose enables detailed logging
 	Verbose bool `json:"verbose,omitempty"`
 
@@ -57,22 +70,31 @@ type Config struct {
 	LogFlushInterval int `json:"log_flush_interval,omitempty"`
 }
 
+// Display backend names for Config.Output
 const (
-	DefaultBaseURL         = "https://trmnl.app"
-	DefaultWindowWidth     = 800
-	DefaultWindowHeight    = 480
-	DefaultLogFlushInterval = 1800 // 30 minutes
-	ConfigFileName         = "config.json"
+	OutputWindow      = "window"
+	OutputFramebuffer = "framebuffer"
+)
+
+const (
+	DefaultBaseURL           = "https://trmnl.app"
+	DefaultWindowWidth       = 800
+	DefaultWindowHeight      = 480
+	DefaultLogFlushInterval  = 1800 // 30 minutes
+	DefaultFramebufferDevice = "/dev/fb0"
+	ConfigFileName           = "config.json"
 )
 
 // Load reads configuration from file and environment variables
 // Priority: CLI flags > Environment variables > Config file > Defaults
 func Load() (*Config, error) {
 	cfg := &Config{
-		BaseURL:          DefaultBaseURL,
-		WindowWidth:      DefaultWindowWidth,
-		WindowHeight:     DefaultWindowHeight,
-		LogFlushInterval: DefaultLogFlushInterval,
+		BaseURL:           DefaultBaseURL,
+		WindowWidth:       DefaultWindowWidth,
+		WindowHeight:      DefaultWindowHeight,
+		LogFlushInterval:  DefaultLogFlushInterval,
+		Output:            OutputWindow,
+		FramebufferDevice: DefaultFramebufferDevice,
 	}
 
 	// Get config directory path
@@ -189,6 +211,14 @@ func (c *Config) Validate() error {
 
 	if c.BaseURL == "" {
 		return fmt.Errorf("base URL cannot be empty")
+	}
+
+	if c.Output != OutputWindow && c.Output != OutputFramebuffer {
+		return fmt.Errorf("invalid output backend: %q (expected \"window\" or \"framebuffer\")", c.Output)
+	}
+
+	if c.Output == OutputFramebuffer && c.FramebufferDevice == "" {
+		return fmt.Errorf("framebuffer_device must be set when output is \"framebuffer\"")
 	}
 
 	if c.WindowWidth <= 0 || c.WindowHeight <= 0 {
