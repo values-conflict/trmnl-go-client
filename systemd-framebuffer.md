@@ -200,13 +200,12 @@ non-root variant is the better hygiene and costs ~10 lines.
   `watchVT()` is meaningful, and the signal-based fallback (SIGHUP/
   USR1/USR2) remains for when someone is *not* on tty7 (it fires
   regardless of VT).
-- **Input (per tianon-framebuffer-input.md):** the raw-TTY reader works
-  by construction — we own the VT, read it in raw mode, and only receive
-  keys while that VT is active (which is exactly when the image is on
-  screen). No evdev, no `input` group, no cross-VT surprises. This is
-  the primary input path; evdev is now only a fallback for deployments
-  where the program doesn't own a VT (e.g. running under a display
-  manager on another VT).
+- **Input (implemented, per tianon-framebuffer-input.md):** the program
+  reads its controlling TTY in near-raw mode — Ctrl+R / Ctrl+T, debounced,
+  ISIG kept so Ctrl+C still exits. It works by construction here (we own
+  the VT), and also over ssh (`/dev/pts/N`), where the shortcuts arrive
+  from the ssh session rather than a device keyboard. No evdev, no
+  `input` group.
 - **VT switch-back flash:** with no getty on tty7, switching back
   shows a blank/last-state screen (not a login prompt), and `watchVT()`
   repaints within ~0.5s.

@@ -234,6 +234,7 @@ func NewFramebufferWindow(cfg *config.Config, verbose bool) (*FramebufferWindow,
 func (w *FramebufferWindow) Show() {
 	w.acquireConsoleTTY()
 	go w.watchVT()
+	go w.watchInput()
 
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
@@ -365,8 +366,20 @@ var (
 	ttyRe         = regexp.MustCompile(`^/dev/tty([0-9]+)$`)
 	cursorHideSeq = []byte{0x1b, '[', '?', '2', '5', 'l'}
 	cursorShowSeq = []byte{0x1b, '[', '?', '2', '5', 'h'}
-	consoleTTY    *os.File // the console TTY, if we own it (nil otherwise)
-	cursorHidden  bool     // whether we hid the cursor on consoleTTY
+	consoleTTY    *os.File      // the controlling TTY, if we have one (nil otherwise)
+	origTermios   *unix.Termios // saved so we can restore it on exit
+	isVT          bool          // whether consoleTTY is a virtual console (/dev/ttyN)
+	cursorHidden  bool          // whether we hid the cursor on consoleTTY
+)
+
+const (
+	keyCtrlR = 0x12 // console/terminal byte for Ctrl+R (manual refresh)
+	keyCtrlT = 0x14 // console/terminal byte for Ctrl+T (rotate)
+
+	// Trigger debounce: held keys auto-repeat in the console's byte
+	// stream (there are no press/release events), so a trigger is
+	// ignored if one fired within this window.
+	triggerDebounce = 2 * time.Second
 )
 
 // tiocgcons is TIOCGCONS, _IO('T', 0x54) from the kernel's uapi
@@ -405,12 +418,43 @@ func (w *FramebufferWindow) acquireConsoleTTY() {
 		return // no controlling terminal; nothing to do
 	}
 	name, err := filepath.EvalSymlinks("/proc/self/fd/" + fmt.Sprint(f.Fd()))
-	if err != nil || !ttyRe.MatchString(name) {
+	if err != nil {
 		f.Close()
-		return // controlling terminal isn't a virtual console
+		return
+	}
+	// Input works on any controlling TTY, including a PTY (e.g. an ssh
+	// session): Ctrl+R / Ctrl+T typed into that session reach us. Cursor
+	// hiding, TIOCGCONS and VT_ACTIVATE only apply to real VTs.
+	isVT = ttyRe.MatchString(name)
+	consoleTTY = f
+
+	// Take the TTY over for input: near-raw mode (cfmakeraw minus ISIG,
+	// so Ctrl+C still raises SIGINT and the usual shutdown path works).
+	if term, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS); err == nil {
+		origTermios = term
+		raw := *term
+		raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP |
+			unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+		// NB: Oflag is left alone on purpose. Clearing OPOST (as
+		// cfmakeraw does) disables ONLCR, so \n would no longer become
+		// \r\n and every log line would drift one column right.
+		raw.Cflag &^= unix.CSIZE | unix.PARENB
+		raw.Cflag |= unix.CS8
+		raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.IEXTEN // keep ISIG
+		raw.Cc[unix.VMIN] = 1
+		raw.Cc[unix.VTIME] = 0
+		if err := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, &raw); err != nil && w.verbose {
+			fmt.Printf("[FrameBuffer] Could not set raw mode: %v\n", err)
+		}
 	}
 
-	consoleTTY = f
+	if !isVT {
+		if w.verbose {
+			fmt.Printf("[FrameBuffer] Controlling TTY %s (not a virtual console): keyboard input enabled, no cursor/VT management\n", name)
+		}
+		return
+	}
+
 	if consoleIsActive(f) {
 		w.setCursor(true)
 		if w.verbose {
@@ -472,7 +516,7 @@ func (w *FramebufferWindow) setCursor(hidden bool) {
 // wipes our image). On the away->active transition we re-hide the cursor
 // and repaint. One ioctl per tick; the cost is negligible.
 func (w *FramebufferWindow) watchVT() {
-	if consoleTTY == nil {
+	if consoleTTY == nil || !isVT {
 		return
 	}
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -496,14 +540,76 @@ func (w *FramebufferWindow) watchVT() {
 	}
 }
 
-// releaseConsoleTTY restores the cursor and closes our TTY when we leave.
+// watchInput reads the console TTY and maps key bytes to actions:
+// Ctrl+R (0x12) -> refresh, Ctrl+T (0x14) -> rotate. Everything else is
+// ignored (including ESC-prefixed Alt/function-key sequences). It exits
+// when the TTY is closed (Close) or becomes unreadable.
+func (w *FramebufferWindow) watchInput() {
+	if consoleTTY == nil {
+		return
+	}
+	if w.verbose {
+		fmt.Println("[FrameBuffer] Keyboard input: Ctrl+R refresh, Ctrl+T rotate")
+	}
+	buf := make([]byte, 1)
+	var lastRefresh, lastRotate time.Time
+	for {
+		select {
+		case <-w.closed:
+			return
+		default:
+		}
+		n, err := consoleTTY.Read(buf)
+		if n == 0 {
+			if err != nil {
+				return // TTY closed or gone
+			}
+			continue
+		}
+		now := time.Now()
+		switch buf[0] {
+		case keyCtrlR:
+			if now.Sub(lastRefresh) < triggerDebounce {
+				continue // key repeat
+			}
+			lastRefresh = now
+			if w.verbose {
+				fmt.Println("[FrameBuffer] Ctrl+R: manual refresh")
+			}
+			if w.refreshCallback != nil {
+				w.refreshCallback()
+			}
+		case keyCtrlT:
+			if now.Sub(lastRotate) < triggerDebounce {
+				continue // key repeat
+			}
+			lastRotate = now
+			if w.verbose {
+				fmt.Println("[FrameBuffer] Ctrl+T: rotate")
+			}
+			if w.rotateCallback != nil {
+				w.rotateCallback()
+			}
+		}
+	}
+}
+
+// releaseConsoleTTY restores the cursor, restores the TTY's original
+// termios, and closes our TTY when we leave.
 func (w *FramebufferWindow) releaseConsoleTTY() {
 	if consoleTTY == nil {
 		return
 	}
 	w.setCursor(false)
+	if origTermios != nil {
+		if err := unix.IoctlSetTermios(int(consoleTTY.Fd()), unix.TCSETS, origTermios); err != nil && w.verbose {
+			fmt.Printf("[FrameBuffer] Could not restore termios: %v\n", err)
+		}
+		origTermios = nil
+	}
 	consoleTTY.Close()
 	consoleTTY = nil
+	isVT = false
 	cursorHidden = false
 }
 
