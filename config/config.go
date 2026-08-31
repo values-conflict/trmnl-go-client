@@ -68,6 +68,10 @@ type Config struct {
 	// LogFlushInterval sets how often logs are flushed to API (in seconds)
 	// Default: 1800 (30 minutes). Set to lower value for development (e.g., 60)
 	LogFlushInterval int `json:"log_flush_interval,omitempty"`
+
+	// DisableLogUpload prevents logs from being sent to the TRMNL API.
+	// Local (verbose) logging is unaffected.
+	DisableLogUpload bool `json:"disable_log_upload,omitempty"`
 }
 
 // Display backend names for Config.Output

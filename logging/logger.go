@@ -28,12 +28,13 @@ type LogEntry struct {
 
 // Logger handles collecting and sending logs to the TRMNL API
 type Logger struct {
-	baseURL    string
-	apiKey     string
-	entries    []LogEntry
-	mu         sync.Mutex
-	maxEntries int
-	verbose    bool
+	baseURL       string
+	apiKey        string
+	entries       []LogEntry
+	mu            sync.Mutex
+	maxEntries    int
+	verbose       bool
+	disableUpload bool // when true, Flush never sends to the API
 }
 
 // NewLogger creates a new logger instance
@@ -45,6 +46,12 @@ func NewLogger(baseURL, apiKey string, verbose bool) *Logger {
 		maxEntries: 20, // Keep last 20 entries
 		verbose:    verbose,
 	}
+}
+
+// SetDisableUpload stops log entries from being sent to the API.
+// Local (verbose) logging is unaffected.
+func (l *Logger) SetDisableUpload(disabled bool) {
+	l.disableUpload = disabled
 }
 
 // Log adds a log entry
@@ -105,6 +112,14 @@ func (l *Logger) Flush() error {
 		if l.verbose {
 			fmt.Println("[Logger] Skipping log upload - no API key configured")
 		}
+		return nil
+	}
+
+	if l.disableUpload {
+		if l.verbose {
+			fmt.Printf("[Logger] Log upload disabled - dropping %d entries\n", len(l.entries))
+		}
+		l.entries = make([]LogEntry, 0, 20)
 		return nil
 	}
 

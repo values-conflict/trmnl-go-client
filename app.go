@@ -55,6 +55,7 @@ var (
 	useFyne          = flag.Bool("use-fyne", false, "Force use of Fyne GUI (default: native window on macOS)")
 	verbose          = flag.Bool("verbose", false, "Enable verbose logging")
 	logFlushInterval = flag.Int("log-flush-interval", 0, "How often to flush logs to API in seconds (default: 1800/30min, set 60 for dev)")
+	noLogUpload      = flag.Bool("no-log-upload", false, "Never send logs to the TRMNL API (local verbose logging unaffected)")
 	showVersion      = flag.Bool("version", false, "Show version information")
 	saveConfig       = flag.Bool("save", false, "Save current settings to config file")
 )
@@ -227,6 +228,9 @@ func runGUIApp() {
 	if *logFlushInterval > 0 {
 		cfg.LogFlushInterval = *logFlushInterval
 	}
+	if *noLogUpload {
+		cfg.DisableLogUpload = true
+	}
 
 	// Save config if requested
 	if *saveConfig {
@@ -263,10 +267,15 @@ func runGUIApp() {
 	needsSetup := cfg.APIKey == "" || *setup
 
 	// Create application
+	logger := logging.NewLogger(cfg.BaseURL, cfg.APIKey, cfg.Verbose)
+	if cfg.DisableLogUpload {
+		logger.SetDisableUpload(true)
+	}
+
 	app := &App{
 		config:     cfg,
 		client:     api.NewClient(cfg, cfg.Verbose),
-		logger:     logging.NewLogger(cfg.BaseURL, cfg.APIKey, cfg.Verbose),
+		logger:     logger,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		refreshCh:  make(chan struct{}, 1), // Buffered to avoid blocking
@@ -280,10 +289,13 @@ func runGUIApp() {
 	m := metrics.Collect()
 
 	if app.verbose {
-		if cfg.APIKey != "" {
+		switch {
+		case cfg.DisableLogUpload:
+			fmt.Println("[Logger] API logging disabled (-no-log-upload)")
+		case cfg.APIKey != "":
 			fmt.Println("[Logger] API logging enabled - logs will be sent to server")
 			fmt.Printf("[Logger] Flush interval: %d seconds (%v)\n", cfg.LogFlushInterval, time.Duration(cfg.LogFlushInterval)*time.Second)
-		} else {
+		default:
 			fmt.Println("[Logger] API logging disabled (no API key)")
 		}
 	}

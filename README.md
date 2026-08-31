@@ -188,6 +188,7 @@ Notes:
   -take-console             Switch the active console to our VT at startup (framebuffer mode)
   -verbose                  Enable verbose logging
   -log-flush-interval int   Log flush interval in seconds (default: 1800, use 60 for dev)
+  -no-log-upload            Never send logs to the TRMNL API (local verbose logging unaffected)
   -version                  Show version
   -save                     Save settings to config
 ```
