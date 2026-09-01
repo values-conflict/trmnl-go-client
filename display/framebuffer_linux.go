@@ -37,9 +37,8 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -245,6 +244,16 @@ func (w *FramebufferWindow) Show() {
 
 	go func() {
 		for sig := range sigCh {
+			// On a virtual console we only act on manual triggers while we're
+			// actually the visible console: a refresh/rotate triggered from
+			// elsewhere (ssh, systemd) would blit over whatever VT the user is
+			// looking at. watchVT redraws when they switch back to us.
+			if isVT && !consoleIsActive(consoleTTY) {
+				if w.verbose {
+					fmt.Printf("[FrameBuffer] %v received while not the active console; ignoring (will redraw on return)\n", sig)
+				}
+				continue
+			}
 			switch sig {
 			case syscall.SIGHUP, syscall.SIGUSR1:
 				if w.verbose {
@@ -337,9 +346,24 @@ func (w *FramebufferWindow) SetOnRotate(callback func()) {
 	w.rotateCallback = callback
 }
 
-// Close unmaps the framebuffer and unblocks Show().
+// Close clears the screen (if we're the one on it), unmaps the
+// framebuffer, and unblocks Show().
 func (w *FramebufferWindow) Close() {
 	w.closeOnce.Do(func() {
+		// If our VT is still the one being displayed and we did NOT
+		// enter the alternate screen (its leave-sequence is what
+		// normally restores the user's console), clear the fb to black
+		// so a stopped service doesn't leave a frozen, stale dashboard
+		// on screen. If the user has switched to a different VT, the fb
+		// shows that VT's kernel-drawn console and we must not touch it.
+		// All-zero is black in every truecolor format.
+		if isVT && consoleIsActive(consoleTTY) && !onAltScreen {
+			clear(w.mmap)
+			if w.verbose {
+				fmt.Println("[FrameBuffer] Cleared screen on shutdown")
+			}
+		}
+
 		close(w.closed)
 
 		w.mu.Lock()
@@ -363,13 +387,49 @@ func (w *FramebufferWindow) Close() {
 // stops the artifact -- but only sequences written to the console's own TTY
 // affect that console.
 var (
-	ttyRe         = regexp.MustCompile(`^/dev/tty([0-9]+)$`)
+	vtNumber      int // our VT number when consoleTTY is a virtual console (else -1)
 	cursorHideSeq = []byte{0x1b, '[', '?', '2', '5', 'l'}
 	cursorShowSeq = []byte{0x1b, '[', '?', '2', '5', 'h'}
 	consoleTTY    *os.File      // the controlling TTY, if we have one (nil otherwise)
 	origTermios   *unix.Termios // saved so we can restore it on exit
 	isVT          bool          // whether consoleTTY is a virtual console (/dev/ttyN)
 	cursorHidden  bool          // whether we hid the cursor on consoleTTY
+	onAltScreen   bool          // whether we're in the console's alternate screen
+)
+
+// controllingTTYDevice decodes field 7 ("tty_nr") of /proc/self/stat
+// into the major/minor of our controlling terminal, using the kernel's
+// tty_nr_to_dev() encoding: major = (nr & 0xff00) >> 8, minor =
+// (nr & 0xff) | ((nr >> 12) & 0xff000). ok is false when there is no
+// controlling terminal or the field cannot be read.
+func controllingTTYDevice() (major, minor uint32, ok bool) {
+	data, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	// Field 2 (comm) is wrapped in parens and may itself contain spaces
+	// or parens: drop everything up to and including the last ')'.
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return 0, 0, false
+	}
+	fields := strings.Fields(s[i+1:])
+	// After comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+	if len(fields) < 5 {
+		return 0, 0, false
+	}
+	nr, err := strconv.ParseUint(fields[4], 10, 32)
+	if err != nil || nr == 0 {
+		return 0, 0, false
+	}
+	ttyNr := uint32(nr)
+	return (ttyNr & 0xff00) >> 8, (ttyNr & 0xff) | ((ttyNr >> 12) & 0xff000), true
+}
+
+const (
+	altScreenOn  = "\x1b[?1049h" // enter alternate screen (saves current screen)
+	altScreenOff = "\x1b[?1049l" // leave alternate screen (restores saved screen)
 )
 
 const (
@@ -382,10 +442,6 @@ const (
 	triggerDebounce = 2 * time.Second
 )
 
-// tiocgcons is TIOCGCONS, _IO('T', 0x54) from the kernel's uapi
-// <linux/tty.h>: 0 if the terminal is the currently active console.
-const tiocgcons = 0x5454
-
 // vtActivate / vtWaitActive, from <linux/vt.h>: plain 16-bit command
 // numbers. VT_ACTIVATE makes the given VT number the active console;
 // VT_WAITACTIVE blocks until the switch has completed. (Same mechanism
@@ -393,16 +449,41 @@ const tiocgcons = 0x5454
 const (
 	vtActivate   = 0x5606
 	vtWaitActive = 0x5607
+	vtGetState   = 0x5603 // get global vt state info
 )
 
-// consoleIsActive reports whether the given TTY is the currently active
-// console (the one being rendered to the framebuffer), via TIOCGCONS.
-// NB: TIOCGCONS also fails with ENOTTY if the kernel doesn't know the
-// command, so a wrong constant degrades to "treated as inactive" rather
-// than anything worse.
+// vtStat mirrors struct vt_stat from <linux/vt.h>. v_active is the
+// currently displayed VT number. (The kernel notes VT_GETSTATE is only
+// reliable for VTs below 16 via the v_state bitmask; v_active itself is
+// fine for our purposes.)
+type vtStat struct {
+	vActive uint16
+	vSignal uint16
+	vState  uint16
+}
+
+// consoleIsActive reports whether our VT is the currently active console
+// (the one being rendered to the framebuffer).
+//
+// Primary: VT_GETSTATE on our tty -- a pure read of fg_console with no
+// permission requirement, which works for unprivileged services.
+// Fallback: /sys/class/tty/tty0/active, which holds the name of the
+// active virtual console (e.g. "tty7"); world-readable. (NOT
+// /sys/class/tty/console/active -- that lists *registered* consoles and,
+// with a serial console enabled, reads "tty0 ttyS1" regardless of the
+// visible VT.)
 func consoleIsActive(f *os.File) bool {
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), tiocgcons, 0)
-	return errno == 0
+	if !isVT {
+		return false
+	}
+	var st vtStat
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vtGetState, uintptr(unsafe.Pointer(&st))); errno == 0 {
+		return int(st.vActive) == vtNumber
+	}
+	if data, err := os.ReadFile("/sys/class/tty/tty0/active"); err == nil {
+		return strings.TrimSpace(string(data)) == fmt.Sprintf("tty%d", vtNumber)
+	}
+	return false
 }
 
 // acquireConsoleTTY opens the process's controlling TTY if it is a
@@ -415,45 +496,83 @@ func consoleIsActive(f *os.File) bool {
 func (w *FramebufferWindow) acquireConsoleTTY() {
 	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return // no controlling terminal; nothing to do
-	}
-	name, err := filepath.EvalSymlinks("/proc/self/fd/" + fmt.Sprint(f.Fd()))
-	if err != nil {
-		f.Close()
+		// No controlling terminal (daemon, ssh without -t): no keyboard
+		// input, no TTY management.
+		if w.verbose {
+			fmt.Printf("[FrameBuffer] No controlling TTY (%v): keyboard input disabled\n", err)
+		}
 		return
+	}
+	// /dev/tty is a magic device: neither its pathname, /proc/self/fd
+	// links, nor even fstat() (which returns the 5:0 magic node) reveal
+	// the real terminal. The kernel-authoritative route is field 7 of
+	// /proc/self/stat ("tty_nr"), decoded with the kernel's
+	// tty_nr_to_dev(): virtual consoles are major 4 (minor = VT number),
+	// PTY slaves major 136 (minor = pts index).
+	major, minor, ok := controllingTTYDevice()
+	var name string
+	vtNumber = -1
+	switch {
+	case ok && major == 4:
+		isVT = true
+		vtNumber = int(minor)
+		name = fmt.Sprintf("/dev/tty%d", minor)
+	case ok && major == 136:
+		name = fmt.Sprintf("/dev/pts/%d", minor)
+	case ok:
+		name = fmt.Sprintf("device %d:%d", major, minor)
+	default:
+		name = "unknown"
 	}
 	// Input works on any controlling TTY, including a PTY (e.g. an ssh
 	// session): Ctrl+R / Ctrl+T typed into that session reach us. Cursor
-	// hiding, TIOCGCONS and VT_ACTIVATE only apply to real VTs.
-	isVT = ttyRe.MatchString(name)
+	// hiding, active-console detection and VT_ACTIVATE only apply to
+	// real VTs.
 	consoleTTY = f
 
 	// Take the TTY over for input: near-raw mode (cfmakeraw minus ISIG,
 	// so Ctrl+C still raises SIGINT and the usual shutdown path works).
-	if term, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS); err == nil {
-		origTermios = term
-		raw := *term
-		raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP |
-			unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
-		// NB: Oflag is left alone on purpose. Clearing OPOST (as
-		// cfmakeraw does) disables ONLCR, so \n would no longer become
-		// \r\n and every log line would drift one column right.
-		raw.Cflag &^= unix.CSIZE | unix.PARENB
-		raw.Cflag |= unix.CS8
-		raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.IEXTEN // keep ISIG
-		raw.Cc[unix.VMIN] = 1
-		raw.Cc[unix.VTIME] = 0
-		if err := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, &raw); err != nil && w.verbose {
-			fmt.Printf("[FrameBuffer] Could not set raw mode: %v\n", err)
+	// Failing to save/restore termios strands the user's terminal, so
+	// either both work or we don't touch the TTY at all -- say which.
+	term, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FrameBuffer] ERROR: could not read terminal settings (%v): leaving terminal untouched, keyboard input disabled\n", err)
+		f.Close()
+		consoleTTY = nil
+		return
+	}
+	origTermios = term
+	raw := *term
+	raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP |
+		unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	// NB: Oflag is left alone on purpose. Clearing OPOST (as cfmakeraw
+	// does) disables ONLCR, so \n would no longer become \r\n and every
+	// log line would drift one column right.
+	raw.Cflag &^= unix.CSIZE | unix.PARENB
+	raw.Cflag |= unix.CS8
+	raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.IEXTEN // keep ISIG
+	raw.Cc[unix.VMIN] = 1
+	raw.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, &raw); err != nil {
+		fmt.Fprintf(os.Stderr, "[FrameBuffer] ERROR: could not set raw mode (%v): restoring terminal and disabling keyboard input\n", err)
+		if err2 := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, term); err2 != nil {
+			fmt.Fprintf(os.Stderr, "[FrameBuffer] ERROR: and could not even restore it: %v -- run 'reset' in that terminal\n", err2)
 		}
+		consoleTTY = nil
+		origTermios = nil
+		f.Close()
+		return
 	}
 
 	if !isVT {
-		if w.verbose {
-			fmt.Printf("[FrameBuffer] Controlling TTY %s (not a virtual console): keyboard input enabled, no cursor/VT management\n", name)
-		}
+		// We're drawing over whatever console is currently active (e.g.
+		// a getty on tty1) and we CANNOT restore it on exit, so say so
+		// unconditionally -- this is how a remote/ssh deployment looks.
+		fmt.Fprintf(os.Stderr, "[FrameBuffer] Warning: not running on a virtual console (TTY is %s): the image covers the active console and the screen is NOT restored on exit. For proper behavior, run on the console itself (see systemd-framebuffer.md).\n", name)
 		return
 	}
+
+	w.setAltScreen(true)
 
 	if consoleIsActive(f) {
 		w.setCursor(true)
@@ -472,23 +591,56 @@ func (w *FramebufferWindow) acquireConsoleTTY() {
 
 	// Take over the display the way X does: activate our VT, then wait
 	// for the switch to settle so we don't blit into a mid-switch fb.
-	vtNo, err := strconv.Atoi(ttyRe.FindStringSubmatch(name)[1])
-	if err != nil {
-		return // unreachable: the regex guarantees digits
-	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vtActivate, uintptr(vtNo)); errno != 0 {
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vtActivate, uintptr(vtNumber)); errno != 0 {
 		if w.verbose {
-			fmt.Printf("[FrameBuffer] VT_ACTIVATE(%d) for %s failed: %v; will repaint when it becomes active\n", vtNo, name, errno)
+			fmt.Printf("[FrameBuffer] VT_ACTIVATE(%d) for %s failed: %v; will repaint when it becomes active\n", vtNumber, name, errno)
 		}
 		return
 	}
-	// arg is ignored; 0 is conventional.
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vtWaitActive, 0); errno != 0 && w.verbose {
-		fmt.Printf("[FrameBuffer] VT_WAITACTIVE failed: %v\n", errno)
+	// arg is the VT number; the kernel rejects 0 with ENXIO. May still
+	// fail with EPERM for unprivileged units that don't own the tty --
+	// harmless: VT_ACTIVATE already switched, and watchVT picks up the
+	// settled console within its 500ms poll.
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vtWaitActive, uintptr(vtNumber)); errno != 0 && w.verbose {
+		fmt.Printf("[FrameBuffer] VT_WAITACTIVE(%d) failed: %v\n", vtNumber, errno)
 	}
 	w.setCursor(true)
 	if w.verbose {
 		fmt.Printf("[FrameBuffer] Activated console %s (take-console), cursor hidden\n", name)
+	}
+}
+
+// setAltScreen enters or leaves the console's alternate screen, the
+// same mechanism full-screen TUIs (vim, htop) use. On a real VT the
+// kernel saves the user's current screen buffer when we enter and
+// restores+redraws it when we leave, so exiting our program puts the
+// user's console back exactly as it was -- no manual `reset` needed.
+// Only valid on VTs (a PTY would just receive the literal escape).
+func (w *FramebufferWindow) setAltScreen(on bool) {
+	if consoleTTY == nil || !isVT || on == onAltScreen {
+		return
+	}
+	seq := altScreenOff
+	if on {
+		seq = altScreenOn
+	}
+	if _, err := consoleTTY.Write([]byte(seq)); err != nil {
+		if w.verbose {
+			action := "leave"
+			if on {
+				action = "enter"
+			}
+			fmt.Printf("[FrameBuffer] Could not %s alternate screen: %v\n", action, err)
+		}
+		return
+	}
+	onAltScreen = on
+	if w.verbose {
+		if on {
+			fmt.Println("[FrameBuffer] Entered alternate screen (user console saved)")
+		} else {
+			fmt.Println("[FrameBuffer] Left alternate screen (user console restored)")
+		}
 	}
 }
 
@@ -511,7 +663,8 @@ func (w *FramebufferWindow) setCursor(hidden bool) {
 	cursorHidden = hidden
 }
 
-// watchVT polls TIOCGCONS so we notice when the console switches back to
+// watchVT polls the active console (/sys/class/tty/tty0/active) so we
+// notice when the console switches back to
 // our VT (the kernel repaints the fb with that VT's old contents, which
 // wipes our image). On the away->active transition we re-hide the cursor
 // and repaint. One ioctl per tick; the cost is negligible.
@@ -594,22 +747,28 @@ func (w *FramebufferWindow) watchInput() {
 	}
 }
 
-// releaseConsoleTTY restores the cursor, restores the TTY's original
-// termios, and closes our TTY when we leave.
+// releaseConsoleTTY restores the TTY's original termios FIRST (a failed
+// restore strands the user with a raw, echo-less terminal, so it gets a
+// loud, unconditional warning), then leaves the alternate screen,
+// restores the cursor, and closes our TTY.
 func (w *FramebufferWindow) releaseConsoleTTY() {
 	if consoleTTY == nil {
 		return
 	}
-	w.setCursor(false)
 	if origTermios != nil {
-		if err := unix.IoctlSetTermios(int(consoleTTY.Fd()), unix.TCSETS, origTermios); err != nil && w.verbose {
-			fmt.Printf("[FrameBuffer] Could not restore termios: %v\n", err)
+		if err := unix.IoctlSetTermios(int(consoleTTY.Fd()), unix.TCSETS, origTermios); err != nil {
+			fmt.Fprintf(os.Stderr, "[FrameBuffer] ERROR: could not restore terminal settings: %v -- run 'reset' or 'stty sane' in that terminal\n", err)
 		}
 		origTermios = nil
+	} else if w.verbose {
+		fmt.Println("[FrameBuffer] No saved termios to restore (termios was never read)")
 	}
+	w.setAltScreen(false)
+	w.setCursor(false)
 	consoleTTY.Close()
 	consoleTTY = nil
 	isVT = false
+	vtNumber = -1
 	cursorHidden = false
 }
 

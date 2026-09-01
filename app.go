@@ -404,21 +404,29 @@ func runGUIApp() {
 	// Start refresh goroutine
 	go app.refreshLoop()
 
-	// Handle signals in goroutine
+	// The signal handler only signals. Teardown happens below, on the
+	// main goroutine: running Close() from this goroutine raced with
+	// process exit -- main could return (killing the process) while
+	// Close was still mid-way through releasing the framebuffer and
+	// restoring the console TTY's termios, which left the terminal raw.
 	go func() {
 		<-sigCh
 		if app.verbose {
 			fmt.Println("[App] Signal received, shutting down...")
 		}
 		close(app.stopCh)
-		app.window.Close()
 	}()
 
-	// Show window (blocks until window is closed)
-	app.window.Show()
+	// Show the window. It blocks until Close(); Close is called below as
+	// part of the sequential shutdown, so run it without blocking main.
+	go app.window.Show()
 
-	// Wait for cleanup to complete
+	// Wait for the refresh loop to fully stop (no in-flight fetch or
+	// blit), then close the window: this releases the framebuffer and,
+	// in framebuffer mode, restores the console TTY. Only once Close
+	// returns is it safe for the process to exit.
 	<-app.doneCh
+	app.window.Close()
 
 	if app.verbose {
 		fmt.Println("[App] Shutdown complete")

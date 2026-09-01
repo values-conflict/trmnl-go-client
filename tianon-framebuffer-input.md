@@ -33,13 +33,45 @@ In framebuffer mode, when the process has a controlling TTY, the program:
   *any* controlling TTY, not just `/dev/ttyN`. Over SSH the controlling
   TTY is `/dev/pts/N`; Ctrl+R typed in that session reaches the program
   as `0x12` and triggers a refresh. VT-specific behaviors (cursor hiding,
-  `TIOCGCONS` repaint-watch, `VT_ACTIVATE`/`-take-console`) remain gated
-  on `/dev/ttyN` via the `isVT` check.
+  active-console repaint, `VT_ACTIVATE`/`-take-console`) remain gated
+  on real VTs via the `isVT` check.
+- **Active-console detection: `VT_GETSTATE`.** The classic ioctl
+  (0x5603) returns `struct vt_stat` whose `v_active` is the currently
+  displayed VT; the kernel implements it as a pure read of
+  `fg_console` with *no permission check*, so unprivileged services can
+  use it. Fallback: `/sys/class/tty/tty0/active`, which holds the name
+  of the active VT (e.g. `tty7`); also world-readable. The tempting
+  lookalike, `/sys/class/tty/console/active`, lists *registered*
+  consoles instead -- with a serial console enabled (the Debian Pi
+  default) it reads `tty0 ttyS1` forever, regardless of the visible
+  VT. (Post-mortem note: an earlier revision of this code used a made-up
+  `TIOCGCONS` constant, 0x5454, which is actually `TIOCSERGWILD`, a
+  serial ioctl -- no such TIOCGCONS exists. It silently failed with
+  ENOTTY and masked the real problem for several test cycles.)
+- **TTY identified by device number, not path.** `/dev/tty` is a magic
+  device: the path (and `/proc/self/fd/N`) is always literally
+  `/dev/tty`, so name-matching can never work. Instead we `fstat` the
+  open fd and read the resolved `st_rdev`: virtual consoles are major 4
+  (minor = VT number), PTY slaves use the dynamic major 136 (matched
+  back to `/dev/pts/N` by rdev for logging). `ttyDeviceName()` does
+  this; it also supplies the VT number for `VT_ACTIVATE` directly.
 - **Debounce instead of key-state tracking.** The console byte stream has
   no press/release distinction — a held key auto-repeats bytes. A trigger
   within `triggerDebounce` (2s) of the previous one is dropped.
 - **ISIG kept on purpose.** Full raw mode would eat Ctrl+C and break the
   graceful-shutdown path.
+- **Shutdown is sequential on the main goroutine (app.go).** The signal
+  handler only closes `stopCh`; main then waits for `doneCh` (refresh
+  loop fully stopped, no in-flight blit) and *then* calls
+  `window.Close()`. This order matters for two real bugs it prevents:
+  (1) running `Close()` from the signal goroutine raced process exit --
+  `main` could return while `Close` was still mid-way through releasing
+  the framebuffer, killing it before the console TTY's termios was
+  restored (the terminal was left raw; the restore syscalls were
+  correct, the process just died first); and (2) `munmap` racing an
+  in-flight `blit` (SIGSEGV). `Close()` after `doneCh` has both
+  properties: nothing can blit, and the process cannot exit until the
+  TTY is released.
 - **Oflag left alone on purpose.** Clearing `OPOST` (as cfmakeraw does)
   disables `ONLCR`, so `\n` stops becoming `\r\n` and log output drifts
   one column right per line. We only ever write plain logs + cursor
@@ -50,8 +82,13 @@ In framebuffer mode, when the process has a controlling TTY, the program:
 
 - While the program runs, the controlling TTY is raw: no line editing /
   echo in that terminal (expected; it's the kiosk's input). Restored on
-  clean exit. `SIGKILL` leaves the TTY raw (`stty sane` fixes it, or
-  reboot).
+  clean exit.
+- On a VT, the program enters the console's **alternate screen**
+  (`\x1b[?1049h`, the vim/htop mechanism) at startup: the kernel saves
+  the user's screen buffer and restores+redraws it on clean exit, so no
+  manual `reset` is needed afterwards. `SIGKILL` (or a crash) skips all
+  of this: the TTY stays raw and the saved screen is only restored by
+  `reset` (or a VT switch away and back).
 - Reading the TTY should not interfere with kernel VT switching
   (Ctrl+Alt+F* is handled by the VT layer before bytes reach a reader),
   but **this must be verified on hardware** (below).
@@ -71,6 +108,11 @@ In framebuffer mode, when the process has a controlling TTY, the program:
 5. Switch back (Ctrl+Alt+F7) → image repaints within ~0.5s (`watchVT`).
 6. SSH: `ssh pi 'trmnl-framebuffer -output=framebuffer ...'` run from a
    *different* VT session → Ctrl+R typed over ssh triggers refresh.
+   Expected warnings: "not running on a virtual console" at startup
+   (the image covers the active console; the screen is NOT restored on
+   exit), and on clean exit the TTY must be back to normal (echo on).
+   If you ever need `reset` after a clean exit, that's a bug: rerun with
+   `-verbose` and check for "could not restore terminal settings".
 7. Ctrl+C exits cleanly; afterwards the console is usable (termios
    restored) and the cursor is back.
 

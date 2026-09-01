@@ -42,9 +42,10 @@ After=network.target network-online.target systemd-vconsole-setup.service
 [Service]
 Type=simple
 # TTYPath makes /dev/tty7 our CONTROLLING terminal. This is what makes
-# /dev/tty work inside the program: cursor control, VT-active detection
-# (TIOCGCONS), and (per the input plan) raw keyboard input all rely on
-# the process owning the TTY.
+# /dev/tty work inside the program: cursor control and raw keyboard
+# input rely on the process owning the TTY. (VT-active detection does
+# NOT need it: it reads /sys/class/tty/tty0/active, which is
+# world-readable.)
 TTYPath=/dev/tty7
 StandardInput=tty
 StandardOutput=journal
@@ -60,7 +61,8 @@ SYSLOG_IDENTIFIER=trmnl-framebuffer
 ExecStart=/usr/local/bin/trmnl-framebuffer -output=framebuffer -fb=/dev/fb0 -model TRMNL -epaper -verbose -take-console
 
 # SIGTERM on stop/exit -> our graceful path: refreshLoop exits, Close()
-# unmaps the fb and restores the console cursor.
+# clears the screen to black (if our console is still on display),
+# unmaps the fb, and restores the console cursor.
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
