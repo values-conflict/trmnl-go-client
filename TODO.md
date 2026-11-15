@@ -1,3 +1,5 @@
+- "active VT" detection is either broken or not being consulted on refresh
+
 - shouldn't the status bar show battery / wifi info too?  what does the non-framebuffer status bar show?
 
 - what does epaper mode actually do?
